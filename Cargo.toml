@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 basalgo = { git = "https://github.com/tugunchinov/basalgo.git", version = "0.1.0" }
 bincode = "2.0.1"
+flate2 = "1.1.1"
 thiserror = "2.0.12"
 
 [dev-dependencies]
-cargo-husky = { version = "1.5.0", features = ["run-cargo-check", "run-cargo-clippy", "run-cargo-fmt"] }
+cargo-husky = { version = "1.5.0", features = [
+    "run-cargo-check",
+    "run-cargo-clippy",
+    "run-cargo-fmt",
+] }
