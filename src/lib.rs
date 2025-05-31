@@ -1,13 +1,20 @@
-// TODO: remove
-#![allow(unused)]
-
 mod memtable;
 mod sstable;
 
 use memtable::MemTable;
-use std::borrow::Borrow;
 
 const MEMTABLE_CAPACITY: usize = 2usize.pow(20);
+
+/*
+    TODO:
+
+
+    1. Implement the service
+    1.1. Write tests
+    2. Add bloom-filter
+    3. Add write-ahead log
+    3.1 Write tests
+*/
 
 pub struct DBService<K, V> {
     memtable: MemTable<K, V>,

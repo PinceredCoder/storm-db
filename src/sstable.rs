@@ -1,7 +1,7 @@
 use std::{
     borrow::Borrow,
     fs,
-    io::{self, Seek},
+    io::{self, Read, Seek, Write},
     marker::PhantomData,
     os::unix::fs::MetadataExt,
     path::PathBuf,
@@ -11,12 +11,36 @@ use crate::memtable::MemTable;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
-// TODO: add compression for blocks
-const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024; // 4KB blocks
+const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024; // 4KB blocks
+
+/*
+    TODO:
+    1. Implement merging of SSTables
+    2. Do not compress too small tables
+    3. Do not reallocate buffers*
+    4. Better estimates for buffers' sizes
+*/
+
+macro_rules! compress {
+    ($in_buf:expr, $out_buf:expr) => {{
+        let mut compressor =
+            flate2::write::DeflateEncoder::new($out_buf, flate2::Compression::fast());
+        compressor.write_all($in_buf)?;
+        compressor.finish()?
+    }};
+}
+
+macro_rules! decompress {
+    ($in_buf:expr, $out_buf:expr) => {{
+        let mut decompressor = flate2::read::DeflateDecoder::new($in_buf);
+        decompressor.read_to_end($out_buf)?;
+        $out_buf
+    }};
+}
 
 struct SSTable<K, V> {
     path: PathBuf,
-    index: Vec<(K, u64)>, // Sparse index: only every Nth key
+    index: Vec<(K, u32)>, // Sparse index: only every Nth key
     _phantom: PhantomData<V>,
 }
 
@@ -28,31 +52,64 @@ impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
         Self::write_from_memtable_with_block_size(memtable, path, DEFAULT_BLOCK_SIZE)
     }
 
-    pub fn write_from_memtable_with_block_size(
+    fn write_from_memtable_with_block_size(
         memtable: MemTable<K, V>,
         path: PathBuf,
-        block_size: u64,
+        block_size: u32,
     ) -> Result<Self, SSTableError> {
         let mut file = fs::File::create(&path)?;
         let mut index = Vec::new();
 
         let sorted_items = memtable.into_sorted_vec();
+
         let mut offset = 0;
         let mut bytes_since_last_index = 0;
-        let mut first_item = true;
+
+        let mut encoded = vec![0u8; 2 * block_size as usize];
+        let mut compressed = Vec::with_capacity(2 * block_size as usize);
+
+        let Some(mut current_key) = sorted_items.first().map(|(k, _v)| k.clone()) else {
+            return Ok(Self {
+                path,
+                index,
+                _phantom: PhantomData,
+            });
+        };
 
         for (k, v) in sorted_items.into_iter() {
-            if first_item || bytes_since_last_index >= block_size {
-                index.push((k.clone(), offset));
+            if bytes_since_last_index >= block_size as usize {
+                index.push((std::mem::replace(&mut current_key, k.clone()), offset));
+
+                let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
+                let compressed_size = compressed.len() as u32;
+
+                file.write_all(&compressed_size.to_le_bytes())?;
+                file.write_all(compressed)?;
+
+                offset += size_of_val(&compressed_size) as u32 + compressed.len() as u32;
+
                 bytes_since_last_index = 0;
+                compressed.clear();
             }
 
-            let bytes_written =
-                bincode::encode_into_std_write((k, v), &mut file, BINCODE_CONFIG)? as u64;
-            offset += bytes_written;
-            bytes_since_last_index += bytes_written;
-            first_item = false;
+            bytes_since_last_index += bincode::encode_into_slice(
+                (k, v),
+                &mut encoded[bytes_since_last_index..],
+                BINCODE_CONFIG,
+            )?;
         }
+
+        if bytes_since_last_index > 0 {
+            index.push((current_key, offset));
+
+            let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
+            let compressed_size = compressed.len() as u32;
+
+            file.write_all(&compressed_size.to_le_bytes())?;
+            file.write_all(compressed)?;
+        }
+
+        file.flush()?;
 
         Ok(Self {
             path,
@@ -67,43 +124,47 @@ impl<K: bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
         Self::read_from_file_with_block_size(path, DEFAULT_BLOCK_SIZE)
     }
 
-    pub fn read_from_file_with_block_size(
+    fn read_from_file_with_block_size(
         path: PathBuf,
-        block_size: u64,
+        block_size: u32,
     ) -> Result<Self, SSTableError> {
         let mut file = fs::File::open(&path)?;
-
         let file_size = file.metadata()?.size();
+        let mut index = Vec::with_capacity((file_size / block_size as u64) as usize);
 
-        let mut index = Vec::with_capacity((file_size / block_size) as usize);
         let mut offset = 0;
-        let mut bytes_since_last_index = 0;
-        let mut first_item = true;
+
+        let mut len_buf = [0u8; size_of::<u32>()];
+        let mut compressed_block_buf = vec![0u8; 2 * block_size as usize];
+        let mut decompressed_block_buf = Vec::with_capacity(2 * block_size as usize);
 
         loop {
-            match bincode::decode_from_std_read::<(K, V), _, _>(&mut file, BINCODE_CONFIG) {
-                Ok((key, _value)) => {
-                    if first_item || bytes_since_last_index >= block_size {
-                        index.push((key, offset));
-                        bytes_since_last_index = 0;
-                    }
-
-                    let new_offset = file.stream_position()?;
-                    let bytes_read = new_offset - offset;
-                    bytes_since_last_index += bytes_read;
-                    offset = new_offset;
-                    first_item = false;
+            if let Err(e) = file.read_exact(&mut len_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                } else {
+                    return Err(e.into());
                 }
-                Err(e) => match e {
-                    bincode::error::DecodeError::UnexpectedEnd { .. } => break,
-                    bincode::error::DecodeError::Io { inner, .. }
-                        if inner.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        break;
-                    }
-                    e => return Err(e.into()),
-                },
-            }
+            };
+
+            let compressed_block_len = u32::from_le_bytes(len_buf) as usize;
+
+            file.read_exact(&mut compressed_block_buf[..compressed_block_len])?;
+
+            let decompressed_block_buf = decompress!(
+                &compressed_block_buf[..compressed_block_len],
+                &mut decompressed_block_buf
+            );
+
+            let ((key, _value), _) = bincode::decode_from_slice::<(K, Option<V>), _>(
+                decompressed_block_buf,
+                BINCODE_CONFIG,
+            )?;
+
+            index.push((key, offset as u32));
+            offset += len_buf.len() + compressed_block_len;
+
+            decompressed_block_buf.clear()
         }
 
         Ok(Self {
@@ -116,55 +177,72 @@ impl<K: bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
 
 impl<K: Ord + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
     pub fn get<Q: Borrow<K>>(&self, key: &Q) -> Result<Option<V>, SSTableError> {
+        self.get_with_block_size(key, DEFAULT_BLOCK_SIZE)
+    }
+
+    fn get_with_block_size<Q: Borrow<K>>(
+        &self,
+        key: &Q,
+        block_size: u32,
+    ) -> Result<Option<V>, SSTableError> {
         if self.index.is_empty() {
             return Ok(None);
         }
 
         let search_result = self.index.binary_search_by(|(k, _)| k.cmp(key.borrow()));
 
-        let (start_offset, end_offset_opt) = match search_result {
-            Ok(exact_idx) => {
-                let start_offset = self.index[exact_idx].1;
-                let end_offset_opt = self.index.get(exact_idx + 1).map(|(_, offset)| *offset);
-                (start_offset, end_offset_opt)
-            }
+        let block_offset = match search_result {
+            Ok(exact_idx) => self.index[exact_idx].1,
             Err(insert_idx) => {
                 if insert_idx == 0 {
                     return Ok(None);
                 }
 
-                let start_idx = insert_idx - 1;
-                let start_offset = self.index[start_idx].1;
-                let end_offset_opt = self.index.get(insert_idx).map(|(_, offset)| *offset);
-                (start_offset, end_offset_opt)
+                self.index[insert_idx - 1].1
             }
         };
 
         let mut file = fs::File::open(&self.path)?;
-        file.seek(io::SeekFrom::Start(start_offset))?;
+        file.seek(io::SeekFrom::Start(block_offset as u64))?;
+
+        let mut len_buf = [0u8; size_of::<u32>()];
+        let mut compressed_block_buf = vec![0u8; 2 * block_size as usize];
+        let mut decompressed_block_buf = Vec::with_capacity(2 * block_size as usize);
+
+        file.read_exact(&mut len_buf)?;
+
+        let compressed_block_len = u32::from_le_bytes(len_buf) as usize;
+
+        file.read_exact(&mut compressed_block_buf[..compressed_block_len])?;
+
+        let decompressed_block_buf = decompress!(
+            &compressed_block_buf[..compressed_block_len],
+            &mut decompressed_block_buf
+        );
+
+        let mut total_bytes_decoded = 0;
 
         loop {
-            let current_offset = file.stream_position()?;
+            match bincode::decode_from_slice::<(K, Option<V>), _>(
+                &decompressed_block_buf[total_bytes_decoded..],
+                BINCODE_CONFIG,
+            ) {
+                Ok(((decoded_key, value), bytes_decoded)) => {
+                    total_bytes_decoded += bytes_decoded;
 
-            if end_offset_opt.is_some_and(|end_offset| current_offset >= end_offset) {
-                break Ok(None);
-            }
-
-            match bincode::decode_from_std_read::<(K, V), _, _>(&mut file, BINCODE_CONFIG) {
-                Ok((decoded_key, value)) => match decoded_key.cmp(key.borrow()) {
-                    std::cmp::Ordering::Equal => return Ok(Some(value)),
-                    std::cmp::Ordering::Greater => return Ok(None),
-                    std::cmp::Ordering::Less => continue,
-                },
-                Err(e) => match e {
-                    bincode::error::DecodeError::UnexpectedEnd { .. } => break Ok(None),
-                    bincode::error::DecodeError::Io { inner, .. }
-                        if inner.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        break Ok(None);
+                    match decoded_key.cmp(key.borrow()) {
+                        std::cmp::Ordering::Equal => return Ok(value),
+                        std::cmp::Ordering::Greater => return Ok(None),
+                        std::cmp::Ordering::Less => continue,
                     }
-                    e => break Err(e.into()),
-                },
+                }
+                Err(e) => {
+                    if matches!(e, bincode::error::DecodeError::UnexpectedEnd { .. }) {
+                        return Ok(None);
+                    } else {
+                        return Err(e.into());
+                    }
+                }
             }
         }
     }
@@ -186,7 +264,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_write_and_read_sstable() {
+    fn test_write_and_read_sstable_1() {
         let mut memtable = MemTable::new(10);
         memtable
             .put(1, "value1".to_string())
@@ -204,12 +282,40 @@ mod tests {
             SSTable::write_from_memtable(memtable, path.clone()).expect("Failed to write SSTable");
 
         // With default block size, small data should still have sparse index
-        assert!(sstable.index.len() <= 3);
+        assert!(sstable.index.len() < 3);
         assert_eq!(sstable.index[0].0, 1); // First key should be indexed
 
         let loaded_sstable =
             SSTable::<i32, String>::read_from_file(path.clone()).expect("Failed to read SSTable");
-        assert!(loaded_sstable.index.len() <= 3);
+        assert!(loaded_sstable.index.len() < 3);
+
+        assert_eq!(loaded_sstable.index, sstable.index);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_write_and_read_sstable_2() {
+        let mut memtable = MemTable::new(10_000);
+
+        for (i, j) in (0..10_000).zip((0..10_000).rev()) {
+            memtable
+                .put(i, format! {"string #{j}"})
+                .expect("Failed to put");
+        }
+
+        let path = PathBuf::from("/tmp/test_sstable.db");
+
+        let sstable =
+            SSTable::write_from_memtable(memtable, path.clone()).expect("Failed to write SSTable");
+
+        assert!(sstable.index.len() < 5_000);
+
+        let loaded_sstable =
+            SSTable::<i32, String>::read_from_file(path.clone()).expect("Failed to read SSTable");
+        assert!(loaded_sstable.index.len() < 5_000);
+
+        assert_eq!(loaded_sstable.index, sstable.index);
 
         fs::remove_file(path).ok();
     }
@@ -237,14 +343,28 @@ mod tests {
         let loaded_sstable = SSTable::read_from_file_with_block_size(path.clone(), 50)
             .expect("Failed to read SSTable");
 
+        assert_eq!(loaded_sstable.index, sstable.index);
+
         for i in 1..=10 {
-            let result = loaded_sstable.get(&i).expect("Failed to get value");
+            let result = loaded_sstable
+                .get_with_block_size(&i, 50)
+                .expect("Failed to get value");
             assert_eq!(result, Some(format!("value{}", i)));
         }
 
         // Test non-existent keys
-        assert_eq!(loaded_sstable.get(&0).expect("Failed to get"), None);
-        assert_eq!(loaded_sstable.get(&11).expect("Failed to get"), None);
+        assert_eq!(
+            loaded_sstable
+                .get_with_block_size(&0, 50)
+                .expect("Failed to get"),
+            None
+        );
+        assert_eq!(
+            loaded_sstable
+                .get_with_block_size(&11, 50)
+                .expect("Failed to get"),
+            None
+        );
 
         fs::remove_file(path).ok();
     }
@@ -359,5 +479,25 @@ mod tests {
         } else {
             panic!("Expected IO error");
         }
+    }
+
+    #[test]
+    fn get_tests_coverage() {
+        let target_dir = std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.parent() // remove executable name
+                    .and_then(|p| p.parent()) // remove 'debug' or 'release'
+                    .map(|p| p.to_path_buf())
+            })
+            .unwrap();
+
+        std::process::Command::new("cargo")
+            .arg("llvm-cov")
+            .arg("--lcov")
+            .arg("--output-path")
+            .arg(format!("{}/lcov.info", target_dir.display()))
+            .output()
+            .expect("failed to execute process");
     }
 }
