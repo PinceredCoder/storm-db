@@ -1,57 +1,55 @@
-use std::borrow::Borrow;
-
-// TODO: use some Trait
-use basalgo::tree::AvlTree;
+use std::{borrow::Borrow, collections::BTreeMap};
 
 /// Use None as the thubmstone
 pub struct MemTable<K, V> {
-    data: AvlTree<K, Option<V>>,
+    data: BTreeMap<K, MemTableEntry<V>>,
     max_size: usize,
+}
+
+#[derive(Debug, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+pub enum MemTableEntry<V> {
+    Value(V),
+    Thumbstone,
 }
 
 impl<K: Ord, V> MemTable<K, V> {
     pub fn new(max_size: usize) -> Self {
         Self {
-            data: AvlTree::new(),
+            data: BTreeMap::new(),
             max_size,
         }
     }
 
     pub fn put(&mut self, key: K, value: V) -> Result<(), MemTableError> {
-        if self.data.size() >= self.max_size {
+        if self.data.len() >= self.max_size {
             return Err(MemTableError::CapacityExceeded);
         }
 
-        self.data.insert(key, Some(value));
+        self.data.insert(key, MemTableEntry::Value(value));
 
         Ok(())
     }
 
-    pub fn get<Q: Borrow<K>>(&self, key: &Q) -> Option<&V> {
-        self.data.get(key)?.as_ref()
+    pub fn get<Q: Ord>(&self, key: &Q) -> Option<&MemTableEntry<V>>
+    where
+        K: Borrow<Q>,
+    {
+        self.data.get(key)
     }
 
     pub fn delete(&mut self, key: K) {
-        self.data.insert(key, None);
+        self.data.insert(key, MemTableEntry::Thumbstone);
     }
 
     pub fn is_full(&self) -> bool {
-        self.data.size() >= self.max_size
-    }
-
-    pub fn size(&self) -> usize {
-        self.data.size()
+        self.data.len() >= self.max_size
     }
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    pub fn capacity(&self) -> usize {
-        self.max_size
-    }
-
-    pub fn into_sorted_vec(self) -> Vec<(K, Option<V>)> {
+    pub fn into_sorted_vec(self) -> Vec<(K, MemTableEntry<V>)> {
         self.data.into_iter().collect()
     }
 }
@@ -71,11 +69,13 @@ mod tests {
         let mut memtable = MemTable::new(10);
 
         assert!(memtable.put(1, "value1".to_string()).is_ok());
-        assert_eq!(memtable.get(&1), Some(&"value1".to_string()));
-        assert_eq!(memtable.size(), 1);
+        assert_eq!(
+            memtable.get(&1),
+            Some(&MemTableEntry::Value("value1".to_string()))
+        );
 
         memtable.delete(1);
-        assert_eq!(memtable.get(&1), None);
+        assert_eq!(memtable.get(&1), Some(&MemTableEntry::Thumbstone));
     }
 
     #[test]

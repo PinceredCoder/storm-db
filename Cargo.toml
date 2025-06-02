@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-basalgo = { git = "https://github.com/tugunchinov/basalgo.git", version = "0.1.0" }
 bincode = "2.0.1"
 flate2 = { version = "1.1.1", default-features = false, features = ["zlib-rs"] }
 thiserror = "2.0.12"
+tokio = { version = "1.45.1", default-features = false, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "sync",
+] }
 
 [dev-dependencies]
 cargo-husky = { version = "1.5.0", features = [
