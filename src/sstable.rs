@@ -18,7 +18,7 @@ const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024; // 4KB blocks
 /*
     TODO:
     1. Implement merging of SSTables
-    2. Add SSTable to Memtable
+    2. Add "SSTable to Memtable"
     3. Add bloom-filter
     4. Do not compress too small tables*
     5. Do not reallocate buffers*
@@ -44,8 +44,7 @@ macro_rules! decompress {
 
 pub struct SSTable<K, V> {
     path: PathBuf,
-    // TODO: pub -> remove
-    pub index: Vec<(K, u32)>, // Sparse index: only every Nth key
+    index: Vec<(K, u32)>, // Sparse index: only every Nth key
     _phantom: PhantomData<V>,
 }
 

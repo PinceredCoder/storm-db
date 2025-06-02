@@ -19,11 +19,9 @@ const SSTABLE_EXTENSION: &str = ".db";
 
 /*
     TODO:
-    1. Implement the service
-    1.1. Write tests
-    2. Add write-ahead log
-    2.1 Write tests
-    3. Load the last SSTable into Memtable when reading from file system
+    1. Add write-ahead log
+    1.1 Write tests
+    2. Load the last SSTable into Memtable when reading from file system
 */
 
 pub struct DBService<K, V> {
