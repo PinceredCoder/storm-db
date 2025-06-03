@@ -162,7 +162,7 @@ impl<K: Ord, V> DBService<K, V> {
             if let Some(entry) = memtable.get(key) {
                 return match entry {
                     MemTableEntry::Value(v) => Ok(Some(v.clone())),
-                    MemTableEntry::Thumbstone => Ok(None),
+                    MemTableEntry::Tombstone => Ok(None),
                 };
             }
         }
@@ -172,7 +172,7 @@ impl<K: Ord, V> DBService<K, V> {
             if let Some(value) = sstable.get(key).await? {
                 return match value {
                     MemTableEntry::Value(v) => Ok(Some(v)),
-                    MemTableEntry::Thumbstone => Ok(None),
+                    MemTableEntry::Tombstone => Ok(None),
                 };
             }
         }

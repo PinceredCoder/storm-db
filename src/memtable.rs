@@ -9,7 +9,7 @@ pub struct MemTable<K, V> {
 #[derive(Debug, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum MemTableEntry<V> {
     Value(V),
-    Thumbstone,
+    Tombstone,
 }
 
 impl<K: Ord, V> MemTable<K, V> {
@@ -38,7 +38,7 @@ impl<K: Ord, V> MemTable<K, V> {
     }
 
     pub fn delete(&mut self, key: K) {
-        self.data.insert(key, MemTableEntry::Thumbstone);
+        self.data.insert(key, MemTableEntry::Tombstone);
     }
 
     pub fn is_full(&self) -> bool {
@@ -75,7 +75,7 @@ mod tests {
         );
 
         memtable.delete(1);
-        assert_eq!(memtable.get(&1), Some(&MemTableEntry::Thumbstone));
+        assert_eq!(memtable.get(&1), Some(&MemTableEntry::Tombstone));
     }
 
     #[test]

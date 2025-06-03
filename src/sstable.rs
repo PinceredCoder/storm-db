@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(result, Some(MemTableEntry::Value("value3".to_string())));
 
         let result = sstable.get(&9).await.expect("Failed to get value");
-        assert_eq!(result, Some(MemTableEntry::Thumbstone));
+        assert_eq!(result, Some(MemTableEntry::Tombstone));
 
         fs::remove_file(path).await.ok();
     }
