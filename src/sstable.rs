@@ -1,6 +1,8 @@
 use crate::memtable::{MemTable, MemTableEntry};
+use bloomfilter::Bloom;
 use std::{
     borrow::Borrow,
+    hash::Hash,
     io::{Read, Write},
     marker::PhantomData,
     os::unix::fs::MetadataExt,
@@ -12,17 +14,16 @@ use tokio::{
 };
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
-
 const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024; // 4KB blocks
+const BLOOM_FILTER_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 /*
     TODO:
     1. Implement merging of SSTables
     2. Add "SSTable to Memtable"
-    3. Add bloom-filter
-    4. Do not compress too small tables*
-    5. Do not reallocate buffers*
-    6. Better estimates for buffers' sizes*
+    3. Do not compress too small tables*
+    4. Do not reallocate buffers*
+    5. Better estimates for buffers' sizes*
 */
 
 macro_rules! compress {
@@ -45,10 +46,28 @@ macro_rules! decompress {
 pub struct SSTable<K, V> {
     path: PathBuf,
     index: Vec<(K, u32)>, // Sparse index: only every Nth key
+    bloom_filter: Bloom<K>,
     _phantom: PhantomData<V>,
 }
 
-impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
+impl<K, V> Default for SSTable<K, V> {
+    fn default() -> Self {
+        Self {
+            path: Default::default(),
+            index: Default::default(),
+            bloom_filter: Bloom::new_for_fp_rate_with_seed(
+                1,
+                BLOOM_FILTER_FALSE_POSITIVE_RATE,
+                &[0u8; 32],
+            )
+            .map_err(SSTableError::BloomFilter)
+            .unwrap(),
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<K: Ord + Clone + Hash + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
     pub async fn write_from_memtable(
         memtable: MemTable<K, V>,
         path: PathBuf,
@@ -64,25 +83,33 @@ impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
         let mut file = fs::File::create(&path).await?;
         let mut index = Vec::new();
 
+        if memtable.is_empty() {
+            return Ok(Self::default());
+        }
+
         let sorted_items = memtable.into_sorted_vec();
 
-        let mut offset = 0;
+        let total_items_cnt = sorted_items.len() as u32;
+        file.write_all(&total_items_cnt.to_le_bytes()).await?;
+
+        let mut offset = size_of::<u32>();
         let mut bytes_since_last_index = 0;
 
         let mut encoded = vec![0u8; 2 * block_size as usize];
         let mut compressed = Vec::with_capacity(2 * block_size as usize);
 
-        let Some(mut current_key) = sorted_items.first().map(|(k, _v)| k.clone()) else {
-            return Ok(Self {
-                path,
-                index,
-                _phantom: PhantomData,
-            });
-        };
+        let mut current_key = sorted_items.first().map(|(k, _v)| k.clone()).unwrap();
+
+        let mut bloom_filter =
+            Bloom::new_for_fp_rate(sorted_items.len(), BLOOM_FILTER_FALSE_POSITIVE_RATE)
+                .map_err(SSTableError::BloomFilter)?;
 
         for (k, v) in sorted_items.into_iter() {
             if bytes_since_last_index >= block_size as usize {
-                index.push((std::mem::replace(&mut current_key, k.clone()), offset));
+                index.push((
+                    std::mem::replace(&mut current_key, k.clone()),
+                    offset as u32,
+                ));
 
                 let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
                 let compressed_size = compressed.len() as u32;
@@ -90,11 +117,13 @@ impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
                 file.write_all(&compressed_size.to_le_bytes()).await?;
                 file.write_all(compressed).await?;
 
-                offset += size_of_val(&compressed_size) as u32 + compressed.len() as u32;
+                offset += size_of_val(&compressed_size) + compressed.len();
 
                 bytes_since_last_index = 0;
                 compressed.clear();
             }
+
+            bloom_filter.set(&k);
 
             bytes_since_last_index += bincode::encode_into_slice(
                 (k, v),
@@ -104,7 +133,7 @@ impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
         }
 
         if bytes_since_last_index > 0 {
-            index.push((current_key, offset));
+            index.push((current_key, offset as u32));
 
             let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
             let compressed_size = compressed.len() as u32;
@@ -118,12 +147,13 @@ impl<K: Ord + Clone + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
         Ok(Self {
             path,
             index,
+            bloom_filter,
             _phantom: PhantomData,
         })
     }
 }
 
-impl<K: bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
+impl<K: Hash + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
     pub async fn read_from_file(path: PathBuf) -> Result<Self, SSTableError> {
         Self::read_from_file_with_block_size(path, DEFAULT_BLOCK_SIZE).await
     }
@@ -134,9 +164,21 @@ impl<K: bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
     ) -> Result<Self, SSTableError> {
         let mut file = fs::File::open(&path).await?;
         let file_size = file.metadata().await?.size();
-        let mut index = Vec::with_capacity((file_size / block_size as u64) as usize);
 
-        let mut offset = 0;
+        if file_size == 0 {
+            return Ok(Self::default());
+        }
+
+        let mut total_items_cnt_buf = [0u8; size_of::<u32>()];
+        file.read_exact(&mut total_items_cnt_buf).await?;
+        let total_items = u32::from_le_bytes(total_items_cnt_buf) as usize;
+
+        let mut index = Vec::with_capacity((file_size / block_size as u64) as usize);
+        let mut offset = total_items_cnt_buf.len();
+
+        let mut bloom_filter =
+            Bloom::new_for_fp_rate(total_items, BLOOM_FILTER_FALSE_POSITIVE_RATE)
+                .map_err(SSTableError::BloomFilter)?;
 
         let mut len_buf = [0u8; size_of::<u32>()];
         let mut compressed_block_buf = vec![0u8; 2 * block_size as usize];
@@ -161,42 +203,62 @@ impl<K: bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
                 &mut decompressed_block_buf
             );
 
-            let ((key, _value), _) = bincode::decode_from_slice::<(K, MemTableEntry<V>), _>(
-                decompressed_block_buf,
-                BINCODE_CONFIG,
-            )?;
+            let mut total_bytes_decoded = 0;
+            let mut first_item = true;
 
-            index.push((key, offset as u32));
+            loop {
+                match bincode::decode_from_slice::<(K, MemTableEntry<V>), _>(
+                    &decompressed_block_buf[total_bytes_decoded..],
+                    BINCODE_CONFIG,
+                ) {
+                    Ok(((key, _value), bytes_decoded)) => {
+                        bloom_filter.set(&key);
+
+                        if first_item {
+                            index.push((key, offset as u32));
+                            first_item = false;
+                        }
+
+                        total_bytes_decoded += bytes_decoded;
+                    }
+                    Err(e) => {
+                        if matches!(e, bincode::error::DecodeError::UnexpectedEnd { .. }) {
+                            break;
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+
             offset += len_buf.len() + compressed_block_len;
-
             decompressed_block_buf.clear()
         }
 
         Ok(Self {
             path,
             index,
+            bloom_filter,
             _phantom: PhantomData,
         })
     }
 }
 
-impl<K: Ord + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
-    pub async fn get<Q: Ord>(&self, key: &Q) -> Result<Option<MemTableEntry<V>>, SSTableError>
-    where
-        K: Borrow<Q>,
-    {
+impl<K: Ord + Hash + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> {
+    pub async fn get(&self, key: &K) -> Result<Option<MemTableEntry<V>>, SSTableError> {
         self.get_with_block_size(key, DEFAULT_BLOCK_SIZE).await
     }
 
-    async fn get_with_block_size<Q: Ord>(
+    async fn get_with_block_size(
         &self,
-        key: &Q,
+        key: &K,
         block_size: u32,
-    ) -> Result<Option<MemTableEntry<V>>, SSTableError>
-    where
-        K: Borrow<Q>,
-    {
+    ) -> Result<Option<MemTableEntry<V>>, SSTableError> {
         if self.index.is_empty() {
+            return Ok(None);
+        }
+
+        if !self.bloom_filter.check(key) {
             return Ok(None);
         }
 
@@ -268,6 +330,8 @@ pub enum SSTableError {
     Encode(#[from] bincode::error::EncodeError),
     #[error("decoding error: {0}")]
     Decode(#[from] bincode::error::DecodeError),
+    #[error("bloom filter error: {0}")]
+    BloomFilter(&'static str),
 }
 
 #[cfg(test)]
@@ -511,5 +575,164 @@ mod tests {
         } else {
             panic!("Expected IO error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_basic_functionality() {
+        let mut memtable = MemTable::new(100);
+
+        // Add some test data
+        for i in 1..=50 {
+            memtable
+                .put(i, format!("value{}", i))
+                .expect("Failed to put");
+        }
+
+        let path = PathBuf::from("/tmp/test_bloom_filter.db");
+        let sstable = SSTable::write_from_memtable(memtable, path.clone())
+            .await
+            .expect("Failed to write SSTable");
+
+        // Test that bloom filter correctly identifies existing keys
+        for i in 1..=50 {
+            assert!(
+                sstable.bloom_filter.check(&i),
+                "Bloom filter should contain key {}",
+                i
+            );
+        }
+
+        // Test that bloom filter correctly rejects some non-existing keys
+        // Note: Due to false positives, some non-existing keys might return true
+        let mut true_negatives = 0;
+        for i in 51..=100 {
+            if !sstable.bloom_filter.check(&i) {
+                true_negatives += 1;
+            }
+        }
+
+        // With a 1% false positive rate and 50 non-existing keys,
+        // we should have most keys correctly identified as not present
+        assert!(
+            true_negatives > 40,
+            "Bloom filter should reject most non-existing keys, got {} true negatives",
+            true_negatives
+        );
+
+        fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_get_optimization() {
+        let mut memtable = MemTable::new(100);
+
+        // Add test data with specific keys
+        let existing_keys = vec![10, 20, 30, 40, 50];
+        for &key in &existing_keys {
+            memtable
+                .put(key, format!("value{}", key))
+                .expect("Failed to put");
+        }
+
+        let path = PathBuf::from("/tmp/test_bloom_filter_get.db");
+        let sstable = SSTable::write_from_memtable(memtable, path.clone())
+            .await
+            .expect("Failed to write SSTable");
+
+        // Test that existing keys are found
+        for &key in &existing_keys {
+            let result = sstable.get(&key).await.expect("Failed to get");
+            assert_eq!(result, Some(MemTableEntry::Value(format!("value{}", key))));
+        }
+
+        // Test that non-existing keys return None quickly due to bloom filter
+        // Most of these should be filtered out by the bloom filter
+        let non_existing_keys = vec![1, 2, 3, 4, 5, 100, 200, 300];
+        for &key in &non_existing_keys {
+            let result = sstable.get(&key).await.expect("Failed to get");
+            assert_eq!(result, None);
+        }
+
+        fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_persistence() {
+        let mut memtable = MemTable::new(100);
+
+        // Add test data
+        for i in 1..=20 {
+            memtable
+                .put(i, format!("value{}", i))
+                .expect("Failed to put");
+        }
+
+        let path = PathBuf::from("/tmp/test_bloom_filter_persistence.db");
+
+        // Write SSTable with bloom filter
+        let original_sstable = SSTable::write_from_memtable(memtable, path.clone())
+            .await
+            .expect("Failed to write SSTable");
+
+        // Read SSTable back from disk
+        let loaded_sstable = SSTable::<i32, String>::read_from_file(path.clone())
+            .await
+            .expect("Failed to read SSTable");
+
+        // Verify bloom filter works after loading from disk
+        for i in 1..=20 {
+            assert!(
+                loaded_sstable.bloom_filter.check(&i),
+                "Loaded bloom filter should contain key {}",
+                i
+            );
+
+            let result = loaded_sstable.get(&i).await.expect("Failed to get");
+            assert_eq!(result, Some(MemTableEntry::Value(format!("value{}", i))));
+        }
+
+        // Test that both bloom filters behave similarly for non-existing keys
+        let test_keys = vec![25, 30, 35, 40, 45];
+        for &key in &test_keys {
+            let original_check = original_sstable.bloom_filter.check(&key);
+            let loaded_check = loaded_sstable.bloom_filter.check(&key);
+            assert_eq!(
+                original_check, loaded_check,
+                "Bloom filter results should match for key {}",
+                key
+            );
+        }
+
+        fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_empty_sstable() {
+        let memtable = MemTable::<i32, String>::new(10);
+        let path = PathBuf::from("/tmp/test_bloom_filter_empty.db");
+
+        let sstable = SSTable::write_from_memtable(memtable, path.clone())
+            .await
+            .expect("Failed to write empty SSTable");
+
+        // Test that empty SSTable handles bloom filter correctly
+        let result = sstable
+            .get(&1)
+            .await
+            .expect("Failed to get from empty SSTable");
+        assert_eq!(result, None);
+
+        // Load empty SSTable from disk
+        let loaded_sstable = SSTable::<i32, String>::read_from_file(path.clone())
+            .await
+            .expect("Failed to read empty SSTable");
+
+        let result = loaded_sstable
+            .get(&1)
+            .await
+            .expect("Failed to get from loaded empty SSTable");
+        assert_eq!(result, None);
+
+        fs::remove_file(path).await.ok();
     }
 }

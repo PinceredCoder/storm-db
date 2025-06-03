@@ -10,6 +10,7 @@ A high-performance, persistent key-value storage engine written in Rust, inspire
 - **Automatic Compaction**: MemTable automatically flushes to SSTable when full
 - **Sparse Indexing**: Memory-efficient block indexing for fast lookups
 - **Block Compression**: Uses deflate compression to reduce storage footprint
+- **Bloom Filters**: Optimizes negative lookups by avoiding unnecessary disk reads
 - **Async/Await Support**: Built with Tokio for high-performance async I/O
 - **Generic Key-Value Types**: Supports any key-value types that implement required traits
 
@@ -30,7 +31,8 @@ Storm DB uses an LSM-tree inspired architecture with two main components:
 
 1. First check the MemTable for the key
 2. If not found, search SSTables in reverse chronological order (newest first)
-3. Return the first match found, or None if key doesn't exist
+3. For each SSTable, check the bloom filter first to avoid unnecessary disk reads
+4. Return the first match found, or None if key doesn't exist
 
 ### Delete Operations
 
@@ -89,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **Block-based**: Data is organized into compressed blocks (default: 4KB)
 - **Sparse Index**: Memory-efficient indexing of block start keys
+- **Bloom Filters**: In-memory probabilistic data structure for fast negative lookups (1% false positive rate)
 - **Compression**: Deflate compression for reduced storage size
 - **Binary Encoding**: Uses bincode for efficient serialization
 
@@ -107,14 +110,16 @@ Each block contains multiple key-value pairs in sorted order.
 Keys and values must implement:
 
 - `Ord` for sorting
+- `Hash` for bloom filter operations
 - `Clone` for internal operations  
 - `bincode::Encode` and `bincode::Decode` for serialization
 
 ## Performance Characteristics
 
 - **Writes**: O(log n) to MemTable, amortized O(1) with batch flushes
-- **Reads**: O(log n) for MemTable + O(log b) for SSTable block lookup where b is blocks per SSTable
-- **Space**: Compressed storage with sparse indexing minimizes memory usage
+- **Reads**: O(log n) for MemTable + O(1) bloom filter check + O(log b) for SSTable block lookup where b is blocks per SSTable
+- **Negative Lookups**: O(1) for most non-existent keys thanks to bloom filters
+- **Space**: Compressed storage with sparse indexing and bloom filters minimizes memory usage
 - **Durability**: Configurable flush-to-disk on shutdown or MemTable overflow
 
 ## Testing
@@ -131,13 +136,14 @@ The comprehensive test suite covers:
 - MemTable overflow and SSTable creation
 - Disk persistence and recovery
 - Delete operations across MemTable/SSTable boundaries
+- Bloom filter functionality and optimization
 - Multiple restart cycles
 
 ## Roadmap
 
 - [ ] Write-Ahead Log (WAL) for crash recovery
 - [ ] SSTable merging and compaction
-- [ ] Bloom filters for faster negative lookups
+- [x] Bloom filters for faster negative lookups
 - [ ] Range queries and iterators
 - [ ] Configurable compression algorithms
 - [ ] Metrics and monitoring
@@ -146,5 +152,6 @@ The comprehensive test suite covers:
 
 - `tokio`: Async runtime and I/O
 - `bincode`: Fast binary serialization
+- `bloomfilter`: Probabilistic data structure for fast negative lookups
 - `flate2`: Compression support
 - `thiserror`: Error handling

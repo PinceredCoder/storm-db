@@ -4,7 +4,6 @@ mod sstable;
 use memtable::{MemTable, MemTableError};
 use sstable::{SSTable, SSTableError};
 use std::{
-    borrow::Borrow,
     ffi,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU16, Ordering},
@@ -43,7 +42,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn read_from_fs<P: AsRef<Path>>(path_to_db: P) -> Result<Self, DBServiceError>
     where
-        K: Clone + bincode::Encode + bincode::Decode<()>,
+        K: Clone + std::hash::Hash + bincode::Encode + bincode::Decode<()>,
         V: bincode::Encode + bincode::Decode<()>,
     {
         if !path_to_db.as_ref().exists() {
@@ -88,7 +87,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn shutdown(&self) -> Result<(), DBServiceError>
     where
-        K: Clone + bincode::Encode,
+        K: Clone + std::hash::Hash + bincode::Encode,
         V: bincode::Encode,
     {
         let memtable = {
@@ -105,7 +104,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn put(&self, key: K, value: V) -> Result<(), DBServiceError>
     where
-        K: Clone + bincode::Encode,
+        K: Clone + std::hash::Hash + bincode::Encode,
         V: bincode::Encode,
     {
         let mut memtable = self.memtable.write().await;
@@ -121,7 +120,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     async fn flush_memtable(&self, memtable: MemTable<K, V>) -> Result<(), DBServiceError>
     where
-        K: Clone + bincode::Encode,
+        K: Clone + std::hash::Hash + bincode::Encode,
         V: bincode::Encode,
     {
         let sstable = self.write_memtable_to_sstable(memtable).await?;
@@ -136,7 +135,7 @@ impl<K: Ord, V> DBService<K, V> {
         memtable: MemTable<K, V>,
     ) -> Result<SSTable<K, V>, DBServiceError>
     where
-        K: Clone + bincode::Encode,
+        K: Clone + std::hash::Hash + bincode::Encode,
         V: bincode::Encode,
     {
         // Ensure directory exists
@@ -152,9 +151,9 @@ impl<K: Ord, V> DBService<K, V> {
         Ok(SSTable::write_from_memtable(memtable, path).await?)
     }
 
-    pub async fn get<Q: Ord>(&self, key: &Q) -> Result<Option<V>, DBServiceError>
+    pub async fn get(&self, key: &K) -> Result<Option<V>, DBServiceError>
     where
-        K: bincode::Decode<()> + Borrow<Q>,
+        K: std::hash::Hash + bincode::Decode<()>,
         V: Clone + bincode::Decode<()>,
     {
         {
@@ -182,7 +181,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn delete(&self, key: K) -> Result<(), DBServiceError>
     where
-        K: Clone + bincode::Encode,
+        K: Clone + std::hash::Hash + bincode::Encode,
         V: bincode::Encode,
     {
         let mut memtable = self.memtable.write().await;
