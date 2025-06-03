@@ -5,6 +5,7 @@ use memtable::{MemTable, MemTableError};
 use sstable::{SSTable, SSTableError};
 use std::{
     ffi,
+    hash::Hash,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU16, Ordering},
 };
@@ -20,17 +21,23 @@ const SSTABLE_EXTENSION: &str = ".db";
     TODO:
     1. Add write-ahead log
     1.1 Write tests
-    2. Load the last SSTable into Memtable when reading from file system
+    2. Optimize put and delete (e. g. create SSTable in a separate tokio task)
 */
 
-pub struct DBService<K, V> {
+pub struct DBService<K: Ord + bincode::Encode, V: bincode::Encode> {
     memtable: RwLock<MemTable<K, V>>,
     sstables: RwLock<Vec<SSTable<K, V>>>,
     next_sstable_id: AtomicU16,
     path_to_db: PathBuf,
 }
 
-impl<K: Ord, V> DBService<K, V> {
+impl<K: Ord + bincode::Encode, V: bincode::Encode> Drop for DBService<K, V> {
+    fn drop(&mut self) {
+        self.shutdown().expect("failed shutting down");
+    }
+}
+
+impl<K: Ord + bincode::Encode, V: bincode::Encode> DBService<K, V> {
     pub fn new(path_to_db: PathBuf) -> Self {
         Self {
             memtable: RwLock::new(MemTable::new(MEMTABLE_CAPACITY)),
@@ -42,8 +49,8 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn read_from_fs<P: AsRef<Path>>(path_to_db: P) -> Result<Self, DBServiceError>
     where
-        K: Clone + std::hash::Hash + bincode::Encode + bincode::Decode<()>,
-        V: bincode::Encode + bincode::Decode<()>,
+        K: Hash + bincode::Decode<()>,
+        V: bincode::Decode<()>,
     {
         if !path_to_db.as_ref().exists() {
             fs::create_dir_all(&path_to_db).await?;
@@ -77,35 +84,53 @@ impl<K: Ord, V> DBService<K, V> {
             sstables.push(sstable);
         }
 
+        let (memtable, next_sstable_id) = if !sstables.is_empty()
+            && (sstables.last().unwrap().total_items() as usize) < MEMTABLE_CAPACITY
+        {
+            (
+                sstables
+                    .pop()
+                    .unwrap()
+                    .read_into_memtable(MEMTABLE_CAPACITY)
+                    .await?,
+                max_id,
+            )
+        } else {
+            (MemTable::new(MEMTABLE_CAPACITY), max_id + 1)
+        };
+
         Ok(Self {
-            memtable: RwLock::new(MemTable::new(MEMTABLE_CAPACITY)),
+            memtable: RwLock::new(memtable),
             sstables: RwLock::new(sstables),
-            next_sstable_id: AtomicU16::new(max_id + 1),
+            next_sstable_id: AtomicU16::new(next_sstable_id),
             path_to_db: path_to_db.as_ref().to_path_buf(),
         })
     }
 
-    pub async fn shutdown(&self) -> Result<(), DBServiceError>
-    where
-        K: Clone + std::hash::Hash + bincode::Encode,
-        V: bincode::Encode,
-    {
+    fn shutdown(&self) -> Result<(), DBServiceError> {
         let memtable = {
-            let mut memtable_guard = self.memtable.write().await;
+            let mut memtable_guard = self.memtable.try_write()?;
             std::mem::replace(&mut *memtable_guard, MemTable::new(0))
         };
 
-        if !memtable.is_empty() {
-            self.write_memtable_to_sstable(memtable).await?;
+        // Ensure directory exists
+        if !self.path_to_db.exists() {
+            std::fs::create_dir_all(&self.path_to_db)?;
         }
+
+        let sstable_id = self.next_sstable_id.fetch_add(1, Ordering::Relaxed);
+        let path = self
+            .path_to_db
+            .join(format!("{SSTABLE_PREFIX}{sstable_id}{SSTABLE_EXTENSION}"));
+
+        SSTable::flush_memtable_sync(memtable, path)?;
 
         Ok(())
     }
 
     pub async fn put(&self, key: K, value: V) -> Result<(), DBServiceError>
     where
-        K: Clone + std::hash::Hash + bincode::Encode,
-        V: bincode::Encode,
+        K: Hash + Clone,
     {
         let mut memtable = self.memtable.write().await;
 
@@ -120,8 +145,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     async fn flush_memtable(&self, memtable: MemTable<K, V>) -> Result<(), DBServiceError>
     where
-        K: Clone + std::hash::Hash + bincode::Encode,
-        V: bincode::Encode,
+        K: Hash + Clone,
     {
         let sstable = self.write_memtable_to_sstable(memtable).await?;
         let mut sstables = self.sstables.write().await;
@@ -135,8 +159,7 @@ impl<K: Ord, V> DBService<K, V> {
         memtable: MemTable<K, V>,
     ) -> Result<SSTable<K, V>, DBServiceError>
     where
-        K: Clone + std::hash::Hash + bincode::Encode,
-        V: bincode::Encode,
+        K: Hash + Clone,
     {
         // Ensure directory exists
         if !self.path_to_db.exists() {
@@ -153,7 +176,7 @@ impl<K: Ord, V> DBService<K, V> {
 
     pub async fn get(&self, key: &K) -> Result<Option<V>, DBServiceError>
     where
-        K: std::hash::Hash + bincode::Decode<()>,
+        K: Hash + bincode::Decode<()>,
         V: Clone + bincode::Decode<()>,
     {
         {
@@ -204,6 +227,8 @@ pub enum DBServiceError {
     SSTable(#[from] SSTableError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("runtime error: {0}")]
+    Runtime(#[from] tokio::sync::TryLockError),
 }
 
 #[cfg(test)]
@@ -311,10 +336,6 @@ mod tests {
                 .await
                 .expect("failed to get");
             assert_eq!(result, Some(MemTableEntry::Value("value100".to_string())));
-
-            db.shutdown()
-                .await
-                .expect("failed writing memtable to disk");
         }
 
         // Read database from filesystem
@@ -536,9 +557,6 @@ mod tests {
             db.put(2001, "value2001".to_string())
                 .await
                 .expect("Failed to put key 2001");
-
-            // Shutdown to persist memtable to disk
-            db.shutdown().await.expect("Failed to shutdown database");
         }
 
         // Phase 2: Test reading from disk after restart
@@ -633,25 +651,20 @@ mod tests {
                     .expect("Failed to get updated SSTable key"),
                 Some("newer_value".to_string())
             );
-
-            db.shutdown()
-                .await
-                .expect("failed writting memtable to disk");
         }
 
         // Phase 3: Test multiple restart cycles
         {
-            // Shutdown again and restart to ensure persistence works multiple times
-            let db = DBService::<i32, String>::read_from_fs(&db_path)
-                .await
-                .expect("Failed to read database from filesystem second time");
+            {
+                // Shutdown again and restart to ensure persistence works multiple times
+                let db = DBService::<i32, String>::read_from_fs(&db_path)
+                    .await
+                    .expect("Failed to read database from filesystem second time");
 
-            db.put(4000, "value4000".to_string())
-                .await
-                .expect("Failed to put in second restart");
-            db.shutdown()
-                .await
-                .expect("Failed to shutdown database second time");
+                db.put(4000, "value4000".to_string())
+                    .await
+                    .expect("Failed to put in second restart");
+            }
 
             let db = DBService::<i32, String>::read_from_fs(&db_path)
                 .await
@@ -678,6 +691,238 @@ mod tests {
         }
 
         // Cleanup
+        fs::remove_dir_all(&db_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_from_fs_loads_small_sstable_into_memtable() {
+        let db_path = PathBuf::from("/tmp/test_db_small_sstable_to_memtable");
+        fs::remove_dir_all(&db_path).ok();
+
+        // Create database with small amount of data (less than MEMTABLE_CAPACITY)
+        {
+            let db = DBService::new(db_path.clone());
+
+            // Add small amount of data
+            for i in 0..100 {
+                db.put(i, format!("value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+        }
+
+        // Read from filesystem - should load SSTable into memtable
+        let db = DBService::<i32, String>::read_from_fs(&db_path)
+            .await
+            .expect("Failed to read from fs");
+
+        // Verify no SSTables remain (loaded into memtable)
+        let sstables = db.sstables.read().await;
+        assert!(
+            sstables.is_empty(),
+            "Small SSTable should have been loaded into memtable"
+        );
+
+        // Verify data is accessible from memtable
+        let memtable = db.memtable.read().await;
+        assert!(!memtable.is_empty(), "Memtable should contain loaded data");
+
+        for i in 0..100 {
+            let result = db.get(&i).await.expect("Failed to get");
+            assert_eq!(result, Some(format!("value{}", i)));
+        }
+
+        fs::remove_dir_all(&db_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_from_fs_keeps_large_sstable_as_sstable() {
+        let db_path = PathBuf::from("/tmp/test_db_large_sstable_remains");
+        fs::remove_dir_all(&db_path).ok();
+
+        // Create database with data equal to MEMTABLE_CAPACITY
+        {
+            let db = DBService::new(db_path.clone());
+
+            // Add exactly MEMTABLE_CAPACITY items
+            for i in 0..MEMTABLE_CAPACITY {
+                db.put(i as i32, format!("value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+        }
+
+        // Read from filesystem - should keep SSTable as SSTable
+        let db = DBService::<i32, String>::read_from_fs(&db_path)
+            .await
+            .expect("Failed to read from fs");
+
+        // Verify SSTable remains as SSTable
+        let sstables = db.sstables.read().await;
+        assert_eq!(sstables.len(), 1, "Large SSTable should remain as SSTable");
+        assert_eq!(sstables[0].total_items() as usize, MEMTABLE_CAPACITY);
+
+        // Verify memtable is empty
+        let memtable = db.memtable.read().await;
+        assert!(
+            memtable.is_empty(),
+            "Memtable should be empty when SSTable is large"
+        );
+
+        // Verify data is still accessible
+        for i in 0..100 {
+            let result = db.get(&i).await.expect("Failed to get");
+            assert_eq!(result, Some(format!("value{}", i)));
+        }
+
+        fs::remove_dir_all(&db_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_from_fs_sstable_id_management() {
+        let db_path = PathBuf::from("/tmp/test_db_sstable_id_management");
+        fs::remove_dir_all(&db_path).ok();
+
+        // Create database and add small SSTable
+        {
+            let db = DBService::new(db_path.clone());
+
+            for i in 0..50 {
+                db.put(i, format!("value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+        }
+
+        {
+            // Read from filesystem (loads SSTable into memtable)
+            let db = DBService::<i32, String>::read_from_fs(&db_path)
+                .await
+                .expect("Failed to read from fs");
+
+            // Add more data to trigger new SSTable creation
+            for i in 100..100 + MEMTABLE_CAPACITY {
+                db.put(i as i32, format!("new_value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+        }
+
+        // Read again and verify SSTable ID is reused correctly
+        let db = DBService::<i32, String>::read_from_fs(&db_path)
+            .await
+            .expect("Failed to read from fs second time");
+
+        // Should have one SSTable with ID 0 (reused from loaded memtable)
+        let sstables = db.sstables.read().await;
+        assert_eq!(sstables.len(), 1, "Should have one SSTable after restart");
+
+        // Verify all data is accessible
+        for i in 0..50 {
+            let result = db.get(&i).await.expect("Failed to get original data");
+            assert_eq!(result, Some(format!("value{}", i)));
+        }
+        for i in 100..100 + MEMTABLE_CAPACITY {
+            let result = db.get(&(i as i32)).await.expect("Failed to get new data");
+            assert_eq!(result, Some(format!("new_value{}", i)));
+        }
+
+        fs::remove_dir_all(&db_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_from_fs_multiple_sstables_only_last_loaded() {
+        let db_path = PathBuf::from("/tmp/test_db_multiple_sstables");
+        fs::remove_dir_all(&db_path).ok();
+
+        // Create database with multiple SSTables
+        {
+            let db = DBService::new(db_path.clone());
+
+            // Create first large SSTable
+            for i in 0..MEMTABLE_CAPACITY + 10 {
+                db.put(i as i32, format!("first_value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+
+            // Create second large SSTable
+            for i in MEMTABLE_CAPACITY + 100..(2 * MEMTABLE_CAPACITY) + 100 {
+                db.put(i as i32, format!("second_value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+
+            // Add small amount to create small final SSTable
+            for i in 5000..5050 {
+                db.put(i, format!("small_value{}", i))
+                    .await
+                    .expect("Failed to put");
+            }
+        }
+
+        // Read from filesystem
+        let db = DBService::<i32, String>::read_from_fs(&db_path)
+            .await
+            .expect("Failed to read from fs");
+
+        // Should have 2 SSTables remaining (first two large ones)
+        let sstables = db.sstables.read().await;
+        assert_eq!(sstables.len(), 2, "Should have 2 large SSTables remaining");
+
+        // Verify memtable contains the small SSTable data
+        let memtable = db.memtable.read().await;
+        assert!(
+            !memtable.is_empty(),
+            "Memtable should contain small SSTable data"
+        );
+
+        // Verify all data is accessible
+        for i in 0..10 {
+            let result = db.get(&i).await.expect("Failed to get first SSTable data");
+            assert_eq!(result, Some(format!("first_value{}", i)));
+        }
+
+        for i in MEMTABLE_CAPACITY + 100..MEMTABLE_CAPACITY + 110 {
+            let result = db
+                .get(&(i as i32))
+                .await
+                .expect("Failed to get second SSTable data");
+            assert_eq!(result, Some(format!("second_value{}", i)));
+        }
+
+        for i in 5000..5050 {
+            let result = db.get(&i).await.expect("Failed to get memtable data");
+            assert_eq!(result, Some(format!("small_value{}", i)));
+        }
+
+        fs::remove_dir_all(&db_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_from_fs_empty_directory() {
+        let db_path = PathBuf::from("/tmp/test_db_empty_directory");
+        fs::remove_dir_all(&db_path).ok();
+
+        // Read from non-existent directory
+        let db = DBService::<i32, String>::read_from_fs(&db_path)
+            .await
+            .expect("Failed to read from empty directory");
+
+        {
+            // Should have empty state
+            let sstables = db.sstables.read().await;
+            assert!(sstables.is_empty(), "Should have no SSTables");
+
+            let memtable = db.memtable.read().await;
+            assert!(memtable.is_empty(), "Should have empty memtable");
+        }
+
+        // Should be able to add data
+        db.put(1, "test".to_string()).await.expect("Failed to put");
+        let result = db.get(&1).await.expect("Failed to get");
+        assert_eq!(result, Some("test".to_string()));
+
         fs::remove_dir_all(&db_path).ok();
     }
 

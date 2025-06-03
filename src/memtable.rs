@@ -1,9 +1,17 @@
 use std::{borrow::Borrow, collections::BTreeMap};
 
-/// Use None as the thubmstone
 pub struct MemTable<K, V> {
     data: BTreeMap<K, MemTableEntry<V>>,
     max_size: usize,
+}
+
+impl<K, V> Default for MemTable<K, V> {
+    fn default() -> Self {
+        Self {
+            data: BTreeMap::default(),
+            max_size: 0,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, bincode::Encode, bincode::Decode)]
@@ -16,6 +24,16 @@ impl<K: Ord, V> MemTable<K, V> {
     pub fn new(max_size: usize) -> Self {
         Self {
             data: BTreeMap::new(),
+            max_size,
+        }
+    }
+
+    pub fn from_iter<T: IntoIterator<Item = (K, MemTableEntry<V>)>>(
+        iter: T,
+        max_size: usize,
+    ) -> Self {
+        Self {
+            data: BTreeMap::from_iter(iter),
             max_size,
         }
     }
