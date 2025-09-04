@@ -1,6 +1,7 @@
 mod error;
 mod flush_sync;
 mod get;
+mod memtable;
 mod read;
 mod write;
 
@@ -62,13 +63,9 @@ impl<K, V> Default for SSTable<K, V> {
         Self {
             path: Default::default(),
             index: Default::default(),
-            bloom_filter: Bloom::new_for_fp_rate_with_seed(
-                1,
-                BLOOM_FILTER_FALSE_POSITIVE_RATE,
-                &[0u8; 32],
-            )
-            .map_err(SSTableError::BloomFilter)
-            .unwrap(),
+            bloom_filter: Bloom::new_for_fp_rate(1, BLOOM_FILTER_FALSE_POSITIVE_RATE)
+                .map_err(SSTableError::BloomFilter)
+                .unwrap(),
             total_items_cnt: 0,
             block_cache: Cache::new(DEFAULT_CACHE_SIZE),
             _phantom: Default::default(),
@@ -79,5 +76,25 @@ impl<K, V> Default for SSTable<K, V> {
 impl<K, V> SSTable<K, V> {
     pub fn total_items(&self) -> u32 {
         self.total_items_cnt
+    }
+}
+
+struct Buffers {
+    len_buf: [u8; 4],
+    compressed_block_buf: Vec<u8>,
+    decompressed_block_buf: Vec<u8>,
+}
+
+impl Buffers {
+    fn from_block_size(block_size: usize) -> Self {
+        let len_buf = [0u8; size_of::<u32>()];
+        let compressed_block_buf = vec![0u8; 2 * block_size];
+        let decompressed_block_buf = Vec::with_capacity(2 * block_size);
+
+        Self {
+            len_buf,
+            compressed_block_buf,
+            decompressed_block_buf,
+        }
     }
 }

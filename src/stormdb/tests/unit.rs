@@ -459,7 +459,7 @@ async fn test_comprehensive_db_operations_with_disk_persistence() {
     }
 
     // Cleanup
-    fs::remove_dir_all(&db_path).await.ok();
+    // fs::remove_dir_all(&db_path).await.ok();
 }
 
 #[tokio::test]

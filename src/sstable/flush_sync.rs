@@ -3,7 +3,7 @@ use crate::{
     memtable::MemTable,
     sstable::{BINCODE_CONFIG, DEFAULT_BLOCK_SIZE, SSTable, SSTableError},
 };
-use std::{io::Write, path::Path};
+use std::{fs, io::Write, path::Path};
 
 impl<K: Ord + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
     pub fn flush_memtable_sync<P: AsRef<Path>>(
@@ -31,37 +31,51 @@ impl<K: Ord + bincode::Encode, V: bincode::Encode> SSTable<K, V> {
 
         let mut bytes_since_last_index = 0;
 
-        let mut encoded = vec![0u8; 2 * block_size as usize];
-        let mut compressed = Vec::with_capacity(2 * block_size as usize);
+        let mut encoded_buf = vec![0u8; 2 * block_size as usize];
+        let mut compressed_buf = Vec::with_capacity(2 * block_size as usize);
 
         for (k, v) in sorted_items.into_iter() {
             if bytes_since_last_index >= block_size as usize {
-                let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
-                let compressed_size = compressed.len() as u32;
-
-                file.write_all(&compressed_size.to_le_bytes())?;
-                file.write_all(compressed)?;
+                Self::write_block_sync(
+                    &mut file,
+                    &mut compressed_buf,
+                    &encoded_buf[..bytes_since_last_index],
+                )?;
 
                 bytes_since_last_index = 0;
-                compressed.clear();
+                compressed_buf.clear();
             }
 
             bytes_since_last_index += bincode::encode_into_slice(
                 (k, v),
-                &mut encoded[bytes_since_last_index..],
+                &mut encoded_buf[bytes_since_last_index..],
                 BINCODE_CONFIG,
             )?;
         }
 
         if bytes_since_last_index > 0 {
-            let compressed = compress!(&encoded[..bytes_since_last_index], &mut compressed);
-            let compressed_size = compressed.len() as u32;
-
-            file.write_all(&compressed_size.to_le_bytes())?;
-            file.write_all(compressed)?;
+            Self::write_block_sync(
+                &mut file,
+                &mut compressed_buf,
+                &encoded_buf[..bytes_since_last_index],
+            )?;
         }
 
         file.flush()?;
+
+        Ok(())
+    }
+
+    fn write_block_sync(
+        file: &mut fs::File,
+        compressed_buf: &mut Vec<u8>,
+        encoded_data: &[u8],
+    ) -> Result<(), SSTableError> {
+        let compressed_buf = compress!(&encoded_data, compressed_buf);
+        let compressed_size = compressed_buf.len() as u32;
+
+        file.write_all(&compressed_size.to_le_bytes())?;
+        file.write_all(compressed_buf)?;
 
         Ok(())
     }

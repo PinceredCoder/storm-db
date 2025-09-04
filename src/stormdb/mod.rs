@@ -94,7 +94,7 @@ impl<K: Ord + bincode::Encode, V: bincode::Encode> DBService<K, V> {
                 sstables
                     .pop()
                     .unwrap()
-                    .read_into_memtable(MEMTABLE_CAPACITY)
+                    .into_memtable(MEMTABLE_CAPACITY)
                     .await?,
                 max_id,
             )

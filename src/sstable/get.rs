@@ -1,7 +1,7 @@
 use crate::{
     decompress,
     memtable::MemTableEntry,
-    sstable::{BINCODE_CONFIG, DEFAULT_BLOCK_SIZE, SSTable, SSTableError},
+    sstable::{BINCODE_CONFIG, Buffers, DEFAULT_BLOCK_SIZE, SSTable, SSTableError},
 };
 use std::hash::Hash;
 use tokio::{
@@ -43,30 +43,8 @@ impl<K: Ord + Hash + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> 
         let decompressed_block_buf = if let Some(buf) = self.block_cache.get(&block_offset).await {
             buf
         } else {
-            let mut file = fs::File::open(&self.path).await?;
-            file.seek(io::SeekFrom::Start(block_offset as u64)).await?;
-
-            let mut len_buf = [0u8; size_of::<u32>()];
-            let mut compressed_block_buf = vec![0u8; 2 * block_size as usize];
-            let mut decompressed_block_buf = Vec::with_capacity(2 * block_size as usize);
-
-            file.read_exact(&mut len_buf).await?;
-
-            let compressed_block_len = u32::from_le_bytes(len_buf) as usize;
-
-            file.read_exact(&mut compressed_block_buf[..compressed_block_len])
-                .await?;
-
-            _ = decompress!(
-                &compressed_block_buf[..compressed_block_len],
-                &mut decompressed_block_buf
-            );
-
-            self.block_cache
-                .insert(block_offset, decompressed_block_buf.clone())
-                .await;
-
-            decompressed_block_buf
+            self.decompress_block(block_offset, block_size as usize)
+                .await?
         };
 
         let mut total_bytes_decoded = 0;
@@ -94,5 +72,34 @@ impl<K: Ord + Hash + bincode::Decode<()>, V: bincode::Decode<()>> SSTable<K, V> 
                 }
             }
         }
+    }
+
+    async fn decompress_block(
+        &self,
+        offset: u32,
+        block_size: usize,
+    ) -> Result<Vec<u8>, SSTableError> {
+        let mut file = fs::File::open(&self.path).await?;
+        file.seek(io::SeekFrom::Start(offset as u64)).await?;
+
+        let mut buffers = Buffers::from_block_size(block_size);
+
+        file.read_exact(&mut buffers.len_buf).await?;
+
+        let compressed_block_len = u32::from_le_bytes(buffers.len_buf) as usize;
+
+        file.read_exact(&mut buffers.compressed_block_buf[..compressed_block_len])
+            .await?;
+
+        _ = decompress!(
+            &buffers.compressed_block_buf[..compressed_block_len],
+            &mut buffers.decompressed_block_buf
+        );
+
+        self.block_cache
+            .insert(offset, buffers.decompressed_block_buf.clone())
+            .await;
+
+        Ok(buffers.decompressed_block_buf)
     }
 }

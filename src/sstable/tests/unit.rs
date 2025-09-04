@@ -420,7 +420,7 @@ async fn test_read_into_memtable_basic() {
         .expect("Failed to write SSTable");
 
     let recovered_memtable = sstable
-        .read_into_memtable(100)
+        .into_memtable(100)
         .await
         .expect("Failed to read into memtable");
 
@@ -459,7 +459,7 @@ async fn test_read_into_memtable_empty_sstable() {
     } else {
         // If a file was created, test normal flow
         let recovered_memtable = sstable
-            .read_into_memtable(100)
+            .into_memtable(100)
             .await
             .expect("Failed to read empty SSTable into memtable");
 
@@ -484,7 +484,7 @@ async fn test_read_into_memtable_with_small_block_size() {
         .expect("Failed to write SSTable");
 
     let recovered_memtable = sstable
-        .read_into_memtable_with_block_size(100, 50)
+        .into_memtable_with_block_size(100, 50)
         .await
         .expect("Failed to read into memtable with small block size");
 
@@ -520,7 +520,7 @@ async fn test_read_into_memtable_with_tombstones() {
         .expect("Failed to write SSTable");
 
     let recovered_memtable = sstable
-        .read_into_memtable(100)
+        .into_memtable(100)
         .await
         .expect("Failed to read into memtable");
 
@@ -558,7 +558,7 @@ async fn test_read_into_memtable_large_dataset() {
         .expect("Failed to write SSTable");
 
     let recovered_memtable = sstable
-        .read_into_memtable(10_000)
+        .into_memtable(10_000)
         .await
         .expect("Failed to read into memtable");
 
